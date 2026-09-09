@@ -1,0 +1,87 @@
+name: parsee_vad_pixel_budget_sweep
+
+model:
+  config: configs/model/qwen35_9b_config.json
+  thinking: false
+  device: 0
+
+pipeline:
+  type: pixel_budget_sweep
+  input_mode: multi_image_9f
+  current_offsets: [-80, -70, -60, -50, -40, -30, -20, -10, 0]
+  q2_positive_threshold: 0.0
+  p3_route:
+    q2_gt: 0.0
+    q3_gte: 0.0
+  p4_route:
+    q2_gte: 1.0
+    q3_gte: 0.0
+    p3_lte: 0.0
+  semantic_rerank:
+    p3_positive: true
+    p4_positive: true
+    p4_negative_suppression: false
+  propagation:
+    enabled: true
+    delta: 0.95
+    beta: 1.5
+    positive_gamma: 0.7
+    cross_zero_history: 3
+    cross_zero_prev_min: 0.5
+    cross_zero_current_floor: -1.0
+    cross_zero_cap: 0.25
+    state_reset_below: 0.05
+    negative_ceiling: -0.000001
+  status_every_anchors: 8
+  append_every: 8
+
+pixel_budgets:
+  default:
+    max_pixels:
+    min_pixels:
+    preserve_processor_default: true
+  256sq:
+    max_pixels: 65536
+    min_pixels: 1
+  384sq:
+    max_pixels: 147456
+    min_pixels: 1
+  512sq:
+    max_pixels: 262144
+    min_pixels: 1
+
+datasets:
+  ucf:
+    adapter: ucf
+    manifest: data/manifests/ucf_test_windows.csv
+    root_env: PARSEE_UCF_ROOT
+    gt_keys: [gt_original, gt]
+  msad:
+    adapter: msad
+    manifest: data/manifests/msad_test_windows.csv
+    root_env: PARSEE_MSAD_ROOT
+    gt_keys: [gt_msad, gt]
+  xd:
+    adapter: raw
+    manifest: data/manifests/xd_violence_test_windows.csv
+    root_env: PARSEE_XD_ROOT
+    gt_keys: [gt]
+  ubnormal:
+    adapter: raw
+    manifest: data/manifests/ubnormal_test_windows.csv
+    root_env: PARSEE_UBNORMAL_ROOT
+    gt_keys: [gt]
+
+matrix:
+  ucf: [default, 256sq, 384sq, 512sq]
+  msad: [default, 256sq, 384sq, 512sq]
+  xd: [default, 256sq, 384sq, 512sq]
+  ubnormal: [default, 256sq, 384sq, 512sq]
+
+output:
+  root: runs
+
+launch:
+  gpus: [0, 1, 2, 3]
+  shards: 4
+  max_parallel_configs: 1

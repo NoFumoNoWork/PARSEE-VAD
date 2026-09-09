@@ -1,0 +1,20 @@
+{
+  "remote": {
+    "model_path": "${PARSEE_QWEN35_9B_PATH}",
+    "output_dir": "runs",
+    "runs_dir": "runs"
+  },
+  "model": {
+    "dtype": "bfloat16",
+    "trust_remote_code": true,
+    "local_files_only": true,
+    "low_cpu_mem_usage": true,
+    "linear_patch_bypass": true
+  },
+  "experiment": {
+    "frame_count": 9,
+    "step_f": 10,
+    "current_offsets": [-80, -70, -60, -50, -40, -30, -20, -10, 0],
+    "max_new_tokens": 40
+  }
+}

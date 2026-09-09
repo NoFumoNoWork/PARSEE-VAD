@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# Large or generated artifacts
+runs/
+outputs/
+logs/
+checkpoints/
+weights/
+models/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# Raw datasets and media
+datasets/
+data/raw/
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.tar
+*.zip
+*.part-*
+
+# Local machine metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+paper_writing/
+experiment/
+

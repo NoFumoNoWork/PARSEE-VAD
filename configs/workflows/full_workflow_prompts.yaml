@@ -1,0 +1,121 @@
+q2_native_anomaly:
+  forward: |
+    Based only on the visual evidence available up to the current time, classify the current event.
+
+    A. Normal
+    B. Abnormal
+
+    Answer with A or B only.
+
+  reverse: |
+    Based only on the visual evidence available up to the current time, classify the current event.
+
+    A. Abnormal
+    B. Normal
+
+    Answer with A or B only.
+
+q3_visible_dynamics:
+  forward: |
+    You are comparing ordered frames from the same camera.
+
+    Judge only directly visible physical change across time.
+    Do not judge whether the scene is normal, abnormal, suspicious, dangerous, or important.
+    Do not infer motion or change merely because a single frame suggests that an event may be occurring.
+
+    A positive answer requires temporal visual evidence across the ordered frames showing that a person, object, interaction, or physical state actually changes over time.
+
+    An already-existing condition does not count as active physical change by itself.
+    Examples include fire already burning, smoke already present, a person already lying down, an already-damaged object, debris, darkness, or a crowd already gathered.
+
+    Global camera motion, illumination changes, compression artifacts, or other imaging changes do not count as the target physical dynamics.
+
+    Question: Do these ordered frames directly demonstrate clear physical change over time?
+
+    A. No. They mainly show an already-existing state or appearance, without clear directly demonstrated physical change over time.
+    B. Yes. They directly demonstrate clear physical change over time in people, objects, interactions, or physical state.
+
+    Answer with only A or B.
+
+  reverse: |
+    You are comparing ordered frames from the same camera.
+
+    Judge only directly visible physical change across time.
+    Do not judge whether the scene is normal, abnormal, suspicious, dangerous, or important.
+    Do not infer motion or change merely because a single frame suggests that an event may be occurring.
+
+    A positive answer requires temporal visual evidence across the ordered frames showing that a person, object, interaction, or physical state actually changes over time.
+
+    An already-existing condition does not count as active physical change by itself.
+    Examples include fire already burning, smoke already present, a person already lying down, an already-damaged object, debris, darkness, or a crowd already gathered.
+
+    Global camera motion, illumination changes, compression artifacts, or other imaging changes do not count as the target physical dynamics.
+
+    Question: Do these ordered frames directly demonstrate clear physical change over time?
+
+    A. Yes. They directly demonstrate clear physical change over time in people, objects, interactions, or physical state.
+    B. No. They mainly show an already-existing state or appearance, without clear directly demonstrated physical change over time.
+
+    Answer with only A or B.
+
+p3_forceful_physical_interaction:
+  forward: |
+    Judge only directly visible physical interaction between people across the ordered observation.
+
+    Do not judge whether the scene is normal, abnormal, suspicious, dangerous, or criminal.
+    Do not infer physical conflict merely because people are running, gathering, pointing, waving, arguing, facing each other, or moving around quickly.
+
+    Question: Is there clear directly visible forceful physical interaction between people, such as hitting, pushing, grabbing, wrestling, restraining, or another sustained physical struggle involving actual bodily contact?
+
+    Ordinary walking or running, people gathering nearby, pointing, waving, gesturing, arguing-like movements, or moving around without clear forceful bodily contact do not count.
+
+    A. No. No clear forceful physical interaction between people is directly visible.
+    B. Yes. Clear forceful physical interaction between people is directly visible.
+
+    Answer with only A or B.
+
+  reverse: |
+    Judge only directly visible physical interaction between people across the ordered observation.
+
+    Do not judge whether the scene is normal, abnormal, suspicious, dangerous, or criminal.
+    Do not infer physical conflict merely because people are running, gathering, pointing, waving, arguing, facing each other, or moving around quickly.
+
+    Question: Is there clear directly visible forceful physical interaction between people, such as hitting, pushing, grabbing, wrestling, restraining, or another sustained physical struggle involving actual bodily contact?
+
+    A. Yes. Clear forceful physical interaction between people is directly visible.
+    B. No. No clear forceful physical interaction between people is directly visible.
+
+    Answer with only A or B.
+
+p4_consequential_object_environment_interaction:
+  forward: |
+    Judge only directly visible physical interaction with objects, property, vehicles, or the physical environment across the ordered observation.
+
+    Do not judge whether the scene is normal, abnormal, suspicious, dangerous, or criminal.
+    Do not infer an event merely from people walking, running, gathering, pointing, waving, arguing-like gestures, or moving around.
+
+    Question: Is there a clear concrete physical interaction or event involving an object, property, vehicle, or the environment that goes beyond ordinary locomotion or social movement?
+
+    Positive examples include directly visible carrying or removing property, manipulating or forcing access to an object or barrier, climbing over or through a barrier, breaking or damaging something, a vehicle collision or other clear vehicle-related physical event, or another directly visible consequential physical interaction with the environment.
+
+    Mere walking or running, crowd gathering, standing around, pointing, waving, talking-like gestures, or ordinary vehicle movement without a clear physical event do not count.
+
+    A. No. No clear concrete object-, vehicle-, or environment-related physical event is directly visible.
+    B. Yes. A clear concrete object-, vehicle-, or environment-related physical event is directly visible.
+
+    Answer with only A or B.
+
+  reverse: |
+    Judge only directly visible physical interaction with objects, property, vehicles, or the physical environment across the ordered observation.
+
+    Do not judge whether the scene is normal, abnormal, suspicious, dangerous, or criminal.
+    Do not infer an event merely from people walking, running, gathering, pointing, waving, arguing-like gestures, or moving around.
+
+    Question: Is there a clear concrete physical interaction or event involving an object, property, vehicle, or the environment that goes beyond ordinary locomotion or social movement?
+
+    Positive examples include directly visible carrying or removing property, manipulating or forcing access to an object or barrier, climbing over or through a barrier, breaking or damaging something, a vehicle collision or other clear vehicle-related physical event, or another directly visible consequential physical interaction with the environment.
+
+    A. Yes. A clear concrete object-, vehicle-, or environment-related physical event is directly visible.
+    B. No. No clear concrete object-, vehicle-, or environment-related physical event is directly visible.
+
+    Answer with only A or B.

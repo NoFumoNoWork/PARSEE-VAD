@@ -1,0 +1,13 @@
+score_field: final_score
+budgets: [384sq, 512sq]
+
+inputs:
+  ucf:
+    gt_manifest: ${PARSEE_UCF_GT_MANIFEST}
+  msad:
+    gt_manifest: ${PARSEE_MSAD_GT_MANIFEST}
+    annotation_csv: ${PARSEE_MSAD_ANNOTATION_CSV}
+  xd:
+    annotation_txt: ${PARSEE_XD_ANNOTATION_TXT}
+  ubnormal:
+    root_env: PARSEE_UBNORMAL_ROOT
