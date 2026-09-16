@@ -20,7 +20,14 @@ except Exception:  # pragma: no cover
 
 from src.evaluation.metrics import ap, auroc, intish, maybe_float
 
-EXPANSION_METHOD = "window_end_backward_hold_nonoverlap"
+DEFAULT_ALIGNMENT = "completed"
+ALIGNMENT_METHODS = {
+    "completed": "window_end_backward_hold_nonoverlap",
+    "availability": "decision_anchor_forward_hold",
+}
+# Backward-compatible constant for callers that only use the paper's primary
+# completed-interval protocol.
+EXPANSION_METHOD = ALIGNMENT_METHODS[DEFAULT_ALIGNMENT]
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -231,27 +238,50 @@ def gt_for_video(dataset: str, vid: str, meta: dict[str, Any]) -> bytearray:
     return gt_from_intervals(nframes, meta.get("intervals", []))
 
 
-def expand_anchor_scores(anchors: list[int], scores: list[float], nframes: int) -> list[float]:
-    """Backward-hold decision scores onto non-overlapping represented frame intervals.
+def expand_anchor_scores(
+    anchors: list[int],
+    scores: list[float],
+    nframes: int,
+    alignment: str = DEFAULT_ALIGNMENT,
+) -> list[float]:
+    """Expand decision scores to frame scores under a declared timing alignment.
 
-    First anchor covers [0, a0]. For k>0, anchor ak covers
-    [a(k-1)+1, ak]. The last anchor score then holds through video end.
+    ``completed`` assigns each decision to the non-overlapping interval that
+    ended at its anchor, matching the primary completed-interval protocol.
+
+    ``availability`` is stricter: a decision becomes usable only at its anchor
+    and is held forward until the next decision. Frames before the first anchor
+    receive a neutral score of 0.0. This frame-index protocol does not attempt
+    to model sub-frame wall-clock inference latency.
     """
     if len(anchors) != len(scores):
         raise ValueError("anchors/scores length mismatch")
     if anchors != sorted(set(anchors)):
         raise ValueError("anchors must be strictly increasing and unique")
+    if alignment not in ALIGNMENT_METHODS:
+        raise ValueError(f"unknown alignment={alignment!r}; expected one of {sorted(ALIGNMENT_METHODS)}")
+
     frame_scores = [0.0] * nframes
+    if alignment == "completed":
+        for idx, anchor in enumerate(anchors):
+            start = 0 if idx == 0 else anchors[idx - 1] + 1
+            start = max(0, min(start, nframes))
+            end = max(start, min(anchor + 1, nframes))
+            if end > start:
+                frame_scores[start:end] = [float(scores[idx])] * (end - start)
+        if anchors:
+            tail_start = max(0, min(anchors[-1] + 1, nframes))
+            if tail_start < nframes:
+                frame_scores[tail_start:] = [float(scores[-1])] * (nframes - tail_start)
+        return frame_scores
+
+    # Availability alignment: score_i is not used before anchor_i.
     for idx, anchor in enumerate(anchors):
-        start = 0 if idx == 0 else anchors[idx - 1] + 1
-        start = max(0, min(start, nframes))
-        end = max(start, min(anchor + 1, nframes))
+        start = max(0, min(anchor, nframes))
+        next_anchor = anchors[idx + 1] if idx + 1 < len(anchors) else nframes
+        end = max(start, min(next_anchor, nframes))
         if end > start:
             frame_scores[start:end] = [float(scores[idx])] * (end - start)
-    if anchors:
-        tail_start = max(0, min(anchors[-1] + 1, nframes))
-        if tail_start < nframes:
-            frame_scores[tail_start:] = [float(scores[-1])] * (nframes - tail_start)
     return frame_scores
 
 
@@ -270,7 +300,7 @@ def audit_decisions(rows: list[dict[str, str]], dataset: str, budget: str, score
     return {"dataset": dataset, "budget": budget, "decision_windows": len(rows), "decision_videos": len({video_id(row) for row in rows}), "duplicate_anchors": dup, "missing_score": missing_score, "failure_rows": failures, "score_field": score_field}
 
 
-def expand_dataset_budget(dataset: str, budget: str, decision_rows: list[dict[str, str]], meta: dict[str, dict[str, Any]], score_field: str, frame_csv: Path | None = None) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, tuple[int, int, int]]]:
+def expand_dataset_budget(dataset: str, budget: str, decision_rows: list[dict[str, str]], meta: dict[str, dict[str, Any]], score_field: str, frame_csv: Path | None = None, alignment: str = DEFAULT_ALIGNMENT) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, tuple[int, int, int]]]:
     by_video: dict[str, list[dict[str, str]]] = defaultdict(list)
     for row in decision_rows:
         by_video[video_id(row)].append(row)
@@ -303,7 +333,7 @@ def expand_dataset_budget(dataset: str, budget: str, decision_rows: list[dict[st
             gt = gt_for_video(dataset, vid, meta[vid])
             if len(gt) != nframes:
                 raise RuntimeError(f"{dataset}/{budget}/{vid}: GT length mismatch")
-            frame_scores = expand_anchor_scores(anchors, scores, nframes)
+            frame_scores = expand_anchor_scores(anchors, scores, nframes, alignment=alignment)
             for frame, (label, score) in enumerate(zip(gt, frame_scores)):
                 y, s = int(label), float(score)
                 labels_all.append(y); scores_all.append(s)
@@ -315,10 +345,15 @@ def expand_dataset_budget(dataset: str, budget: str, decision_rows: list[dict[st
             gt_signature[vid] = (nframes, int(sum(gt)), nframes - int(sum(gt)))
             if len(sanity_rows) < 20:
                 for idx, anchor in enumerate(anchors[:4]):
-                    start = 0 if idx == 0 else anchors[idx - 1] + 1
-                    end = min(anchor, nframes - 1)
+                    if alignment == "completed":
+                        start = 0 if idx == 0 else anchors[idx - 1] + 1
+                        end = min(anchor, nframes - 1)
+                    else:
+                        start = max(0, anchor)
+                        next_anchor = anchors[idx + 1] if idx + 1 < len(anchors) else nframes
+                        end = min(next_anchor - 1, nframes - 1)
                     if start <= end:
-                        sanity_rows.append({"dataset": dataset, "budget": budget, "video_id": vid, "anchor": anchor, "decision_score": scores[idx], "frame_start": start, "frame_end": end, "expanded_score": scores[idx], "gt_positive_frames_in_range": sum(gt[start:end + 1]), "causal_check": "PASS"})
+                        sanity_rows.append({"dataset": dataset, "budget": budget, "alignment": alignment, "video_id": vid, "anchor": anchor, "decision_score": scores[idx], "frame_start": start, "frame_end": end, "expanded_score": scores[idx], "gt_positive_frames_in_range": sum(gt[start:end + 1]), "causal_check": "PASS"})
     finally:
         if handle is not None:
             handle.close()
@@ -327,7 +362,7 @@ def expand_dataset_budget(dataset: str, budget: str, decision_rows: list[dict[st
         "dataset": dataset, "budget": budget, "videos": len(by_video), "total_frames_evaluated": len(labels_all),
         "gt_positive_frames": sum(labels_all), "gt_negative_frames": len(labels_all) - sum(labels_all),
         "decision_windows": sum(len(v) for v in by_video.values()), "missing_decisions": 0, "missing_videos": 0,
-        "expansion_method": EXPANSION_METHOD, "frame_micro_AUROC": auroc(labels_all, scores_all), "frame_AP": ap(labels_all, scores_all),
+        "alignment": alignment, "expansion_method": ALIGNMENT_METHODS[alignment], "frame_micro_AUROC": auroc(labels_all, scores_all), "frame_AP": ap(labels_all, scores_all),
         "macro_video_AUROC": (sum(macro_values) / len(macro_values)) if macro_values else None,
         "macro_video_AUROC_videos_used": len(macro_values), "frame_score_csv": str(frame_csv) if frame_csv else "",
     }

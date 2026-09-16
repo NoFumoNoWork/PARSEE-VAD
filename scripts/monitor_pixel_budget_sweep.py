@@ -5,11 +5,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-import yaml
+from src.utils.io import read_yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 RUN_GROUP = "parsee_vad_pixel_budget_sweep"
-DEFAULT_CONFIG = ROOT / "configs" / "workflows" / "pixel_budget_sweep.yaml"
+DEFAULT_CONFIG = ROOT / "configs" / "workflows" / "parsee_final.yaml"
 
 
 def read_json(path: Path) -> dict[str, Any]: return json.loads(path.read_text(encoding="utf-8"))
@@ -18,7 +18,7 @@ def read_json(path: Path) -> dict[str, Any]: return json.loads(path.read_text(en
 def main() -> None:
     parser = argparse.ArgumentParser(description="Monitor the PARSEE-VAD pixel-budget matrix.")
     parser.add_argument("--run-id", default="main"); parser.add_argument("--run-dir", type=Path, default=None); parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    args = parser.parse_args(); config = yaml.safe_load(args.config.read_text(encoding="utf-8")) or {}; shards = int((config.get("launch",{}) or {}).get("shards",4))
+    args = parser.parse_args(); config = read_yaml(args.config) or {}; shards = int((config.get("launch",{}) or {}).get("shards",4))
     run_dir = args.run_dir.resolve() if args.run_dir else ROOT/"runs"/RUN_GROUP/args.run_id
     print(f"# {RUN_GROUP} :: {run_dir}"); total_done=total_expected=total_errors=complete=configs=0
     for dataset,budgets in (config.get("matrix",{}) or {}).items():

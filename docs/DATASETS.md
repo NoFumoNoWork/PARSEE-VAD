@@ -11,7 +11,7 @@ PARSEE_UBNORMAL_ROOT
 
 ## Decision Manifest
 
-The sweep consumes one CSV per dataset. Shared code relies on these stable fields:
+The workflow consumes one CSV per dataset. Shared code relies on these stable fields:
 
 ```text
 video_id       stable video identifier
@@ -23,9 +23,11 @@ decision_index within-video decision index
 gt             anchor-level diagnostic label when available
 ```
 
-UCF/MSAD manifests may additionally contain `gt_original`, `gt_msad`, `label_scope`, `video`, `total_frames`, `frame_count`, or interval metadata. Dataset-specific extra columns are allowed.
+UCF/MSAD manifests may additionally contain `gt_original`, `gt_msad`, `label_scope`,
+`video`, `total_frames`, `frame_count`, or interval metadata. Dataset-specific extra
+columns are allowed.
 
-Expected files for the public sweep are:
+Expected public-safe manifest filenames are:
 
 ```text
 data/manifests/ucf_test_windows.csv
@@ -38,11 +40,9 @@ Do not commit raw videos or manifests containing private absolute machine paths.
 
 ## Official Evaluation Inputs
 
-The frame-level evaluator expects these external official-annotation inputs:
-
 ### UCF-Crime
 
-`PARSEE_UCF_GT_MANIFEST` points to a CSV with one metadata row per video (duplicates are tolerated) containing:
+`PARSEE_UCF_GT_MANIFEST` points to a CSV with one metadata row per video containing:
 
 ```text
 video
@@ -54,7 +54,8 @@ original_intervals
 
 ### MSAD
 
-`PARSEE_MSAD_GT_MANIFEST` points to a CSV containing at least `video` (or `video_id`) and `frame_count` (or `total_frames`).
+`PARSEE_MSAD_GT_MANIFEST` points to a CSV containing at least `video` (or
+`video_id`) and `frame_count` (or `total_frames`).
 
 `PARSEE_MSAD_ANNOTATION_CSV` points to the anomaly annotation table containing:
 
@@ -64,19 +65,26 @@ starting frame of anomaly
 ending frame of anomaly
 ```
 
-The evaluation protocol treats these intervals as zero-based and inclusive.
+The evaluator treats these intervals as zero-based and inclusive.
 
 ### XD-Violence
 
-`PARSEE_XD_ANNOTATION_TXT` points to the official test annotation text. Remaining integer tokens are parsed as anomaly start/end pairs. Video frame counts are read from the corresponding video files under `PARSEE_XD_ROOT`.
+`PARSEE_XD_ANNOTATION_TXT` points to the official test annotation text. Remaining
+integer tokens are parsed as anomaly start/end pairs. Video frame counts are read
+from the corresponding video files under `PARSEE_XD_ROOT`.
 
 ### UBnormal
 
-Official test masks are read from the dataset tree under `PARSEE_UBNORMAL_ROOT`. Normal videos receive all-zero GT. For abnormal videos, non-empty `*_gt.png` masks mark anomalous frames.
+Official test masks are read from the dataset tree under `PARSEE_UBNORMAL_ROOT`.
+Normal videos receive all-zero GT. For abnormal videos, non-empty `*_gt.png` masks
+mark anomalous frames.
 
-The repository includes the 158 abnormal and 53 normal official-test name lists used by `scripts/build_ubnormal_manifest.py` (211 test videos total).
+The repository includes the abnormal and normal official-test name lists used by
+`scripts/build_ubnormal_manifest.py`.
 
-## Frame-Level Alignment
+## Frame-Level Timing Alignments
+
+### Completed interval (`--alignment completed`)
 
 For anchors `a0 < a1 < ...`:
 
@@ -86,4 +94,14 @@ score(ak) -> [a(k-1)+1, ak]   for k > 0
 last score -> [last_anchor+1, video_end]
 ```
 
-The assignment is piecewise constant. It intentionally does not linearly interpolate between anchors.
+### Availability (`--alignment availability`)
+
+```text
+neutral 0 -> [0, a0-1]
+score(ak) -> [ak, a(k+1)-1]
+last score -> [last_anchor, video_end]
+```
+
+The second protocol never applies a decision before its anchor and is therefore a
+stricter frame-index view of online availability. Neither protocol linearly
+interpolates between decisions.

@@ -6,23 +6,22 @@ import json
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from src.evaluation.frame_level import (
-    EXPANSION_METHOD, audit_decisions, expand_dataset_budget, load_msad_meta,
+    ALIGNMENT_METHODS, DEFAULT_ALIGNMENT, audit_decisions, expand_dataset_budget, load_msad_meta,
     load_ucf_meta, load_ubnormal_meta, load_xd_meta, read_csv_rows,
     resolve_config_path, write_csv,
 )
+from src.utils.io import read_yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "evaluation" / "official_framelevel.yaml"
 DATASETS = ["ucf", "xd", "msad", "ubnormal"]
 
 
-def read_scores(run_dir: Path, dataset: str, budget: str) -> list[dict[str, str]]:
+def read_scores(run_dir: Path, dataset: str, budget: str, score_file_prefix: str = "") -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     pattern = run_dir / "outputs" / dataset / budget
-    for path in sorted(pattern.glob("shard_*_of_*/tables/final_workflow_scores.csv")):
+    for path in sorted(pattern.glob(f"shard_*_of_*/tables/{score_file_prefix}final_workflow_scores.csv")):
         rows.extend(read_csv_rows(path))
     if not rows:
         raise FileNotFoundError(f"no score CSVs found under {pattern}")
@@ -49,15 +48,22 @@ def main() -> None:
     parser.add_argument("--budgets", nargs="+", default=None, help="Override budgets from config, e.g. 384sq 512sq")
     parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=DATASETS)
     parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--score-file-prefix", default="", help="Optional prefix for score CSV filenames, useful for isolated tests.")
+    parser.add_argument("--artifact-prefix", default="", help="Optional prefix for generated evaluation artifact filenames.")
+    parser.add_argument(
+        "--alignment", choices=sorted(ALIGNMENT_METHODS), default=DEFAULT_ALIGNMENT,
+        help="Frame-score timing: completed interval (primary) or decision-time availability (stricter).",
+    )
     parser.add_argument("--write-frame-scores", action="store_true", help="Write per-frame score CSVs (can be large).")
     args = parser.parse_args()
 
     run_dir = args.run_dir.resolve()
-    config = yaml.safe_load(args.config.read_text(encoding="utf-8")) or {}
+    config = read_yaml(args.config) or {}
     budgets = args.budgets or list(config.get("budgets", ["384sq", "512sq"]))
     score_field = str(config.get("score_field", "final_score"))
     output = args.output_dir.resolve() if args.output_dir else run_dir / "official_framelevel"
     output.mkdir(parents=True, exist_ok=True)
+    artifact_prefix = args.artifact_prefix or ("" if args.alignment == DEFAULT_ALIGNMENT else f"{args.alignment}_")
 
     all_metrics: list[dict[str, Any]] = []
     protocol_audit: list[dict[str, Any]] = []
@@ -65,12 +71,12 @@ def main() -> None:
     signatures: dict[tuple[str, str], dict[str, tuple[int, int, int]]] = {}
 
     for dataset in args.datasets:
-        rows_by_budget = {budget: read_scores(run_dir, dataset, budget) for budget in budgets}
+        rows_by_budget = {budget: read_scores(run_dir, dataset, budget, args.score_file_prefix) for budget in budgets}
         meta = load_meta(dataset, rows_by_budget[budgets[0]], config)
         for budget, rows in rows_by_budget.items():
             audit_row = audit_decisions(rows, dataset, budget, score_field)
-            frame_path = output / "frame_scores" / f"{dataset}_{budget}_frame_scores.csv" if args.write_frame_scores else None
-            audit, sanity_rows, signature = expand_dataset_budget(dataset, budget, rows, meta, score_field, frame_path)
+            frame_path = output / "frame_scores" / f"{artifact_prefix}{dataset}_{budget}_frame_scores.csv" if args.write_frame_scores else None
+            audit, sanity_rows, signature = expand_dataset_budget(dataset, budget, rows, meta, score_field, frame_path, alignment=args.alignment)
             audit_row.update(audit)
             protocol_audit.append(audit_row)
             all_metrics.append({
@@ -86,9 +92,9 @@ def main() -> None:
             if signatures[(dataset, budget)] != base_sig:
                 raise RuntimeError(f"{dataset}: GT/video signatures differ between {budgets[0]} and {budget}")
 
-    write_csv(output / "official_framelevel_metrics.csv", all_metrics)
-    write_csv(output / "protocol_audit.csv", protocol_audit)
-    write_csv(output / "causal_expansion_sanity.csv", sanity)
+    write_csv(output / f"{artifact_prefix}official_framelevel_metrics.csv", all_metrics)
+    write_csv(output / f"{artifact_prefix}protocol_audit.csv", protocol_audit)
+    write_csv(output / f"{artifact_prefix}causal_expansion_sanity.csv", sanity)
 
     by_key = {(row["dataset"], row["budget"]): row for row in all_metrics}
     table_rows: list[dict[str, Any]] = []
@@ -103,9 +109,9 @@ def main() -> None:
             row["UBnormal_micro_AUC"] = by_key[("ubnormal", budget)]["frame_micro_AUROC"]
             row["UBnormal_macro_video_AUC"] = by_key[("ubnormal", budget)]["macro_video_AUROC"]
         table_rows.append(row)
-    write_csv(output / "table1_official_metrics.csv", table_rows)
-    summary = {"run_dir": str(run_dir), "score_field": score_field, "expansion_method": EXPANSION_METHOD, "budgets": budgets, "metrics": all_metrics, "table1": table_rows}
-    (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_csv(output / f"{artifact_prefix}table1_official_metrics.csv", table_rows)
+    summary = {"run_dir": str(run_dir), "score_field": score_field, "alignment": args.alignment, "expansion_method": ALIGNMENT_METHODS[args.alignment], "budgets": budgets, "metrics": all_metrics, "table1": table_rows}
+    (output / f"{artifact_prefix}summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({"output_dir": str(output), "table1": table_rows}, ensure_ascii=False, indent=2))
 
 

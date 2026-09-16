@@ -3,7 +3,11 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from sklearn.metrics import average_precision_score, roc_auc_score
+try:
+    from sklearn.metrics import average_precision_score, roc_auc_score
+except Exception:  # pragma: no cover - exercised in minimal environments
+    average_precision_score = None
+    roc_auc_score = None
 
 
 def intish(value: Any, default: int = 0) -> int:
@@ -38,13 +42,45 @@ def maybe_float(value: Any) -> float | None:
 def auroc(labels: list[int], scores: list[float]) -> float | None:
     if not labels or len(set(labels)) < 2:
         return None
-    return float(roc_auc_score(labels, scores))
+    if roc_auc_score is not None:
+        return float(roc_auc_score(labels, scores))
+    pos = [score for label, score in zip(labels, scores) if label == 1]
+    neg = [score for label, score in zip(labels, scores) if label == 0]
+    if not pos or not neg:
+        return None
+    wins = 0.0
+    for p_score in pos:
+        for n_score in neg:
+            if p_score > n_score:
+                wins += 1.0
+            elif p_score == n_score:
+                wins += 0.5
+    return wins / (len(pos) * len(neg))
 
 
 def ap(labels: list[int], scores: list[float]) -> float | None:
     if not labels or sum(labels) == 0:
         return None
-    return float(average_precision_score(labels, scores))
+    if average_precision_score is not None:
+        return float(average_precision_score(labels, scores))
+    positives = sum(labels)
+    order = sorted(range(len(labels)), key=lambda idx: scores[idx], reverse=True)
+    total = 0.0
+    tp = 0
+    idx = 0
+    while idx < len(order):
+        score = scores[order[idx]]
+        end = idx
+        group_pos = 0
+        while end < len(order) and scores[order[end]] == score:
+            group_pos += int(labels[order[end]] == 1)
+            end += 1
+        if group_pos:
+            precision_at_group_end = (tp + group_pos) / end
+            total += group_pos * precision_at_group_end
+            tp += group_pos
+        idx = end
+    return total / positives
 
 
 def metrics(rows: list[dict[str, Any]], gt_key: str, score_key: str) -> dict[str, Any]:

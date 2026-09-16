@@ -6,10 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from src.qwen.model import DEFAULT_MODEL_CONFIG, load_qwen
-from src.utils.io import write_json
+from src.utils.io import read_yaml, write_json
 from src.workflows import full_workflow
 
 
@@ -42,13 +40,9 @@ class LazyQwenScorer:
         return self.runtime
 
 
-def read_yaml(path: Path) -> dict[str, Any]:
-    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run one PARSEE-VAD full-workflow shard.")
-    parser.add_argument("--config", type=Path, default=REPO_ROOT / "configs" / "workflows" / "pixel_budget_sweep.yaml")
+    parser.add_argument("--config", type=Path, default=REPO_ROOT / "configs" / "workflows" / "parsee_final.yaml")
     parser.add_argument("--prompts", type=Path, default=REPO_ROOT / "configs" / "workflows" / "full_workflow_prompts.yaml")
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--shard-index", type=int, required=True)

@@ -1,38 +1,56 @@
 # PARSEE-VAD
 
-PARSEE-VAD is a training-free online video anomaly detection workflow built around a vision-language model and proposition-aware evidence routing. Each decision uses only current and past frames; the model scores short A/B prompts from logits, selectively executes additional evidence probes, reranks the native anomaly score with bounded positive evidence, and optionally applies causal temporal propagation.
+**PARSEE-VAD: Efficient Training-Free Online Video Anomaly Detection via Proposition-Aware Routing and Streaming Evidence Escalation**
 
-## Method
+PARSEE-VAD is a training-free, causal video-anomaly detection pipeline built on a
+frozen visual-language model. The public code follows the paper-final method:
+**Expose → Acquire → Maintain**.
 
-Each decision anchor observes nine ordered frames:
+## Method at a Glance
+
+Each decision anchor observes nine causal frames:
 
 ```text
 [-80, -70, -60, -50, -40, -30, -20, -10, 0]
 ```
 
-The frames are passed as nine independent images. PARSEE-VAD computes:
+The proposition-logit interface reads balanced A/B logits for:
 
-- **Q2**: native visible anomaly / suspicious-behavior score;
-- **Q3**: directly visible physical development across the ordered frames;
-- **P3**: forceful physical interaction between people;
-- **P4**: consequential interaction with an object, vehicle, or the environment.
+- **Q2** — native visible anomaly / suspicious-behavior evidence;
+- **Q3** — visible physical-development state;
+- **P3** — forceful physical interaction between people;
+- **P4** — consequential interaction with an object, vehicle, or environment.
 
-Routing is fixed by the experiment protocol:
-
-```text
-P3 runs when Q2 > 0 and Q3 >= 0.
-P4 runs when Q2 >= 1 and Q3 >= 0 and P3 <= 0.
-```
-
-Positive P3/P4 evidence reranks Q2:
+### 1. Proposition-Aware Routing
 
 ```text
-semantic_score = Q2
-               + tanh(P3) if P3 > 0
-               + tanh(P4) if P4 > 0
+P3 executes iff Q2 > 0 and Q3 >= 0
+P4 executes iff Q2 >= 1 and Q3 >= 0 and P3 <= 0
 ```
 
-A non-positive P4 score never suppresses the semantic score. See [`docs/WORKFLOW.md`](docs/WORKFLOW.md) for the exact cache, routing, propagation, pixel-budget and evaluation protocol.
+### 2. Bounded current-window fusion
+
+With `alpha = 0.75`, routed proposition evidence is fused into the current Q2
+score without temporal state. The exact operator is implemented in
+[`src/workflows/scoring.py`](src/workflows/scoring.py).
+
+### 3. Streaming Evidence Escalation
+
+The temporal stage has two bounded parts:
+
+```text
+one-step correction carry: rho_c = 0.5
+finite-horizon SEE:         H = 2, tau = 0.2, eta = 0.5, rho = 0.5
+```
+
+The correction carry stores only the previous **raw** positive PAR correction;
+inherited rescue is never written back. SEE stores only pre-SEE scores, so rescued
+outputs do not recursively enter future state.
+
+The canonical paper configuration is
+[`configs/workflows/parsee_final.yaml`](configs/workflows/parsee_final.yaml).
+The equations and state semantics are documented in
+[`docs/WORKFLOW.md`](docs/WORKFLOW.md).
 
 ## Repository Layout
 
@@ -43,29 +61,50 @@ PARSEE-VAD/
 │   ├── evaluation/
 │   ├── model/
 │   └── workflows/
-├── data/manifests/
+│       └── parsee_final.yaml
+├── data/
+│   └── manifests/
 ├── docs/
+│   ├── DATASETS.md
+│   ├── RUNTIME.md
+│   └── WORKFLOW.md
 ├── requirements/
 ├── scripts/
+│   ├── evaluate.py
+│   ├── replay_parsee.py
+│   ├── run_full_workflow_worker.py
+│   └── run_pixel_budget_sweep.py
 ├── src/
+│   ├── evaluation/
+│   ├── qwen/
+│   └── workflows/
+│       ├── full_workflow.py
+│       └── scoring.py
 └── tests/
 ```
 
-Generated runs, raw videos, model weights and private logs remain outside version control.
+Raw datasets, model weights, generated runs, and private machine-specific artifacts
+are intentionally excluded.
 
 ## Installation
 
-The reference environment used PyTorch 2.9.1 and Transformers 5.13.1. Install a PyTorch build appropriate for your CUDA/runtime, then install the remaining dependencies:
+The recorded reference environment uses Python 3.11, PyTorch 2.9.1+cu128, and
+Transformers 5.13.1.
 
 ```bash
 pip install -r requirements.txt
 ```
 
-`requirements/environment_snapshot.txt` records the fuller reference environment for debugging reproducibility; it is not required as the primary installation specification.
+For development/tests:
 
-## Paths and Model Setup
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
 
-Export the model and dataset roots (see `.env.example`):
+## Paths and Public Manifests
+
+Set model/dataset roots as environment variables; see [`.env.example`](.env.example):
 
 ```bash
 export PARSEE_QWEN35_9B_PATH=/path/to/Qwen3.5-9B
@@ -75,95 +114,80 @@ export PARSEE_XD_ROOT=/path/to/XD-Violence
 export PARSEE_UBNORMAL_ROOT=/path/to/UBnormal
 ```
 
-Public manifests should store video paths **relative** to these dataset roots. Absolute paths are accepted for private/local runs but should not be committed.
+Decision manifests are expected under `data/manifests/`. Their schema and the
+official annotation inputs are described in [`docs/DATASETS.md`](docs/DATASETS.md).
+Do not commit manifests containing absolute private paths.
 
-The model config is `configs/model/qwen35_9b_config.json`, which resolves `${PARSEE_QWEN35_9B_PATH}` at runtime.
+## Fresh Inference
 
-## Decision Manifests
-
-The full sweep expects:
-
-```text
-data/manifests/ucf_test_windows.csv
-data/manifests/msad_test_windows.csv
-data/manifests/xd_violence_test_windows.csv
-data/manifests/ubnormal_test_windows.csv
-```
-
-The stable contract and dataset-specific GT inputs are documented in [`docs/DATASETS.md`](docs/DATASETS.md). UBnormal includes a public builder:
+The default workflow points to the paper-final configuration:
 
 ```bash
-python -m scripts.build_ubnormal_manifest
+python -m scripts.run_pixel_budget_sweep \
+  --config configs/workflows/parsee_final.yaml \
+  --run-id main \
+  --resume
 ```
 
-when `PARSEE_UBNORMAL_ROOT` is set.
+The runner supports the configured UCF-Crime, XD-Violence, MSAD, and UBnormal
+matrices and writes the exact workflow/model/prompt snapshots into each run.
 
-## Run the Pixel-Budget Sweep
+## CPU Replay from Routed Logits
 
-Run all four datasets and all four budgets:
+If Q2/Q3/P3/P4 logits have already been produced, the final scorer can be replayed
+without loading the VLM:
 
 ```bash
-python -m scripts.run_pixel_budget_sweep --run-id main --resume
+python -m scripts.replay_parsee \
+  path/to/final_workflow_scores.csv \
+  --output runs/replay/ucf_512.csv
 ```
 
-Or run one configuration:
+Replay reconstructs the deployed P3/P4 route and resets temporal state at each
+video boundary.
+
+## Frame-Level Evaluation
+
+The evaluator supports the two timing alignments reported with the paper.
+
+Primary completed-interval alignment:
 
 ```bash
-python -m scripts.run_pixel_budget_sweep --run-id ucf384 --dataset ucf --budget 384sq
+python -m scripts.evaluate \
+  --run-dir runs/parsee_vad_pixel_budget_sweep/main \
+  --alignment completed
 ```
 
-Outputs live under:
-
-```text
-runs/parsee_vad_pixel_budget_sweep/<run-id>/
-```
-
-The launcher stores workflow/prompt/model-config SHA-256 hashes in `run_manifest.json` and refuses to resume the same run id after either file changes.
-
-Monitor a run with:
+Stricter availability alignment:
 
 ```bash
-python -m scripts.monitor_pixel_budget_sweep --run-id main
+python -m scripts.evaluate \
+  --run-dir runs/parsee_vad_pixel_budget_sweep/main \
+  --alignment availability
 ```
 
-## Official Frame-Level Evaluation
+`completed` assigns each decision to the non-overlapping interval ending at its
+anchor. `availability` does not use a decision before its anchor; it holds the score
+forward until the next decision, with a neutral score before the first anchor. This
+frame-index alignment does not model sub-frame wall-clock inference latency.
 
-The inference sweep writes decision-anchor scores. Official benchmark metrics are computed afterward from `final_score` using non-overlapping window-end backward hold:
+Headline metrics are:
 
-```text
-first anchor a0:        score(a0) -> [0, a0]
-subsequent anchor ak:   score(ak) -> [a(k-1)+1, ak]
-last score:             held through video_end
-```
+- UCF-Crime: frame AUROC;
+- XD-Violence: frame AP;
+- MSAD: frame AUROC and AP;
+- UBnormal: micro frame AUROC and macro video AUROC.
 
-No linear interpolation is used.
+## Runtime
 
-Set the official annotation paths in `.env.example`, then run:
-
-```bash
-python -m scripts.evaluate   --run-dir runs/parsee_vad_pixel_budget_sweep/main
-```
-
-The default evaluation config (`configs/evaluation/official_framelevel.yaml`) evaluates `384sq` and `512sq`. Use `--budgets` to evaluate other completed budgets.
-
-Headline outputs include:
-
-- UCF-Crime frame AUROC;
-- XD-Violence frame AP;
-- MSAD frame AUROC and AP;
-- UBnormal micro frame AUROC and macro video AUROC.
-
-`scikit-learn` is used for AUROC/AP so tied frame scores are handled by standard metric semantics. Per-frame CSV materialization is optional via `--write-frame-scores`.
-
-## Tests
-
-The CPU-only regression tests cover positive-only semantic fusion, propagation reset, non-overlapping frame expansion, AP ties and the no-upscale pixel-budget rule:
-
-```bash
-pip install -r requirements-dev.txt
-python -m pytest -q
-```
+The final direct MSAD 512sq full-set measurements and the measurement protocol are
+summarized in [`docs/RUNTIME.md`](docs/RUNTIME.md). The reported 71.7% reduction is
+a **specialist-query reduction**; the measured dense-to-routed end-to-end latency
+reduction is 13.2%.
 
 ## Reproducibility Boundary
 
-The default workflow recomputes configurations from the supplied decision manifests. The formal Q2/Q3/P3/P4 prompts, routing thresholds, semantic fusion, propagation and pixel-budget resizing are defined by the checked-in configs and implementation.
+`src/workflows/scoring.py` is the canonical implementation of the paper-final score
+construction. `configs/workflows/parsee_final.yaml` explicitly records every method
+parameter used by that implementation. Public experiments should reuse these two
+artifacts rather than duplicating equations or relying on Python defaults.

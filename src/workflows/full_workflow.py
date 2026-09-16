@@ -5,7 +5,6 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -28,6 +27,7 @@ from src.qwen.sequential import (
 from src.utils.io import write_json
 from src.utils.parsing import parse_int_list
 from src.utils.video import SequentialVideoFrameReader
+from src.workflows.scoring import PARSEEState, PROPOSITION_RUNTIME_VERSION
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -64,17 +64,56 @@ FIELDNAMES = [
     "p4_executed",
     "p3_route_reason",
     "p4_route_reason",
-    "p3_positive_delta",
-    "p4_positive_delta",
-    "p4_strong_negative_delta",
+    # Final current-window dimensionless PAR diagnostics.
+    "q3_evidence",
+    "p3_evidence",
+    "p4_evidence",
+    "par_evidence_raw",
+    "par_evidence",
+    "par_alpha",
+    "par_scale",
+    "par_delta",
+    "par_score",
+    # Compatibility aliases used by existing evaluators/viewers.
+    "local_score",
     "semantic_score",
-    "prop_state_before",
-    "prop_recovery_raw",
-    "prop_recovery_candidate",
-    "prop_cross_zero",
-    "prop_positive_envelope",
-    "prop_reason",
-    "prop_state_after",
+    # One-step positive PAR-correction carry diagnostics.
+    "carry_enabled",
+    "carry_rho",
+    "carry_prev_par_delta",
+    "carry_prev_positive_delta",
+    "carry_budget",
+    "carry_rescue_delta",
+    "carry_adjusted_par_delta",
+    "carry_score",
+    "carry_applied",
+    "carry_reason",
+    "carry_score_minus_q2",
+    "carry_score_minus_raw_par",
+    # Final two-decision positive-only, non-recursive SEE diagnostics.
+    "pre_see_score",
+    "see_rho",
+    "see_horizon",
+    "see_valley_ratio",
+    "see_q2_continuity",
+    "see_prev1_score",
+    "see_prev2_score",
+    "see_prev1_positive",
+    "see_prev2_positive",
+    "see_state_level",
+    "see_valley_threshold",
+    "see_valley_error",
+    "see_q2_prev",
+    "see_q2_continuous",
+    "see_gate",
+    "see_positive_valley",
+    "see_negative_valley",
+    "see_weighted_history",
+    "see_candidate",
+    "see_delta",
+    "see_applied",
+    "see_cross_zero",
+    "see_reason",
     "final_score",
     "current_frames",
     "video_path",
@@ -100,6 +139,12 @@ FIELDNAMES = [
     "total_window_time_sec",
 ]
 FAILURE_FIELDS = ["dataset", "pixel_budget", "category", "video_id", "anchor", "decision_index", "error", "video_path"]
+
+
+def _seq_slice(value: Any, start: int | None = None, end: int | None = None) -> Any:
+    if value is None or not hasattr(value, "shape"):
+        return value
+    return value[..., start:end]
 
 
 def _repo_path(raw: str | Path) -> Path:
@@ -207,6 +252,43 @@ def _completed_keys(path: Path) -> set[tuple[str, int]]:
         return {(_video_id(row), intish(row.get("anchor", 0))) for row in csv.DictReader(handle)}
 
 
+def _completed_scoring_state(path: Path) -> dict[str, list[tuple[int, float, float, float]]]:
+    """Read state needed for safe continuation of an interrupted run.
+
+    Each tuple is (anchor, raw_par_delta, pre_see_score, q2).  These values restore
+    the one-step correction state and finite-horizon anomaly-state observer.
+    Files from older scorer schemas are rejected rather than silently mixed.
+    """
+    if not path.exists():
+        return {}
+    by_video: dict[str, list[tuple[int, float, float, float]]] = {}
+    with path.open(newline="", encoding="utf-8-sig", errors="replace") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = set(reader.fieldnames or [])
+        required = {"par_delta", "carry_score", "q2_score"}
+        missing = required - fieldnames
+        if missing:
+            rows = list(reader)
+            if rows:
+                raise RuntimeError(
+                    f"existing score file {path} is missing {sorted(missing)}; "
+                    "start a fresh run directory for the correction-carry scorer"
+                )
+            return {}
+        for row in reader:
+            raw_delta = _finite_float(row.get("par_delta"))
+            pre_see = _finite_float(row.get("carry_score"))
+            q2_score = _finite_float(row.get("q2_score"))
+            if raw_delta is None or pre_see is None or q2_score is None:
+                raise RuntimeError(f"missing/invalid temporal state in existing score file: {path}")
+            vid = _video_id(row)
+            by_video.setdefault(vid, []).append(
+                (intish(row.get("anchor", 0)), raw_delta, pre_see, q2_score)
+            )
+    for values in by_video.values():
+        values.sort(key=lambda item: item[0])
+    return by_video
+
 def _failure_keys(path: Path) -> set[tuple[str, int]]:
     if not path.exists():
         return set()
@@ -288,6 +370,101 @@ def _image_grid_stats(inputs: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _build_text_tail_cache(
+    scorer: Any,
+    prompts: dict[str, Any],
+    *,
+    num_images: int,
+) -> dict[str, dict[str, Any]]:
+    """Pre-encode fixed textual probe tails once per shard.
+
+    The cached tensors intentionally exclude the visual prefix.  At runtime each
+    branch reconstructs the exact full sequence as:
+
+        current visual prefix tokens + cached textual tail
+
+    and recomputes position ids for that sequence.  This preserves the same
+    token-tail construction as the older per-probe `_encode()` path while
+    avoiding repeated processor/tokenizer work for fixed proposition text.
+    """
+
+    blank_images = [Image.new("RGB", BLANK_SIZE, "black") for _ in range(num_images)]
+    cache: dict[str, dict[str, Any]] = {}
+    expected_split: int | None = None
+    canonical_prefix_ids: list[int] | None = None
+    canonical_prefix_mm_types: list[int] | None = None
+    for probe in PROBE_ORDER:
+        forward, reverse = _prompt_pair(prompts, PROMPT_KEYS[probe])
+        for direction, prompt in (("forward", forward), ("reverse", reverse)):
+            encoded = _encode(scorer.processor, blank_images, prompt, thinking=scorer.thinking)
+            ends = _vision_ends(encoded)
+            if len(ends) != num_images:
+                raise RuntimeError(
+                    f"tail-cache build expected {num_images} visual blocks for {probe}/{direction}, "
+                    f"found {len(ends)}"
+                )
+            split = int(ends[-1])
+            if expected_split is None:
+                expected_split = split
+            elif split != expected_split:
+                raise RuntimeError(
+                    f"tail-cache visual split mismatch: expected {expected_split}, "
+                    f"got {split} for {probe}/{direction}"
+                )
+
+            prefix_ids = encoded["input_ids"][0, :split].detach().cpu().tolist()
+            mm_types = encoded.get("mm_token_type_ids")
+            prefix_mm_types = (
+                mm_types[0, :split].detach().cpu().tolist() if mm_types is not None else None
+            )
+            if canonical_prefix_ids is None:
+                canonical_prefix_ids = prefix_ids
+                canonical_prefix_mm_types = prefix_mm_types
+            else:
+                if prefix_ids != canonical_prefix_ids:
+                    raise RuntimeError(
+                        f"tail-cache prefix tokens differ for {probe}/{direction}; "
+                        "prompt text is no longer strictly after the shared visual prefix"
+                    )
+                if prefix_mm_types != canonical_prefix_mm_types:
+                    raise RuntimeError(
+                        f"tail-cache mm_token_type_ids differ for {probe}/{direction}; "
+                        "refusing unsafe cached-tail reuse"
+                    )
+
+            cache[f"{probe}_{direction}"] = {
+                "split": split,
+                "input_ids": _seq_slice(encoded["input_ids"], split, None).detach().cpu(),
+                "mm_token_type_ids": (
+                    _seq_slice(encoded.get("mm_token_type_ids"), split, None).detach().cpu()
+                    if encoded.get("mm_token_type_ids") is not None
+                    else None
+                ),
+            }
+    return cache
+
+
+def _cached_tail_inputs(base_inputs: dict[str, Any], split: int, tail: dict[str, Any]) -> dict[str, Any]:
+    # The number of visual placeholder tokens can vary with the processed image
+    # grid.  Cached tails deliberately start *after* a synthetic visual prefix
+    # and are appended after the current row's real visual prefix.
+    torch = __import__("torch")
+    full = dict(base_inputs)
+    full["input_ids"] = torch.cat([
+        _seq_slice(base_inputs["input_ids"], 0, split),
+        tail["input_ids"],
+    ], dim=-1)
+    full["attention_mask"] = torch.ones_like(full["input_ids"])
+    if base_inputs.get("mm_token_type_ids") is not None and tail.get("mm_token_type_ids") is not None:
+        full["mm_token_type_ids"] = torch.cat([
+            _seq_slice(base_inputs["mm_token_type_ids"], 0, split),
+            tail["mm_token_type_ids"],
+        ], dim=-1)
+    else:
+        full.pop("mm_token_type_ids", None)
+    return full
+
+
 def _score_probe(
     scorer: Any,
     images: list[Any],
@@ -316,94 +493,91 @@ def _score_probe(
     return {**_score_from_logits(f_logits, r_logits, a_id=scorer.a_id, b_id=scorer.b_id), "query_tail_sec": f_sec + r_sec}
 
 
-@dataclass
-class ControlledPropagationState:
-    delta: float = 0.95
-    beta: float = 1.5
-    positive_gamma: float = 0.7
-    cross_zero_history: int = 3
-    cross_zero_prev_min: float = 0.5
-    cross_zero_current_floor: float = -1.0
-    cross_zero_cap: float = 0.25
-    state_reset_below: float = 0.05
-    negative_ceiling: float = -1e-6
-    evidence: float = 0.0
-    previous_final: float = 0.0
-    semantic_history: list[float] = field(default_factory=list)
+def _score_probe_cached_tail(
+    scorer: Any,
+    base_cache: Any,
+    split: int,
+    base_inputs: dict[str, Any],
+    forward_tail: dict[str, Any],
+    reverse_tail: dict[str, Any],
+) -> dict[str, Any]:
+    f_inputs = _cached_tail_inputs(base_inputs, split, forward_tail)
+    f_positions = _full_positions(scorer.model, f_inputs, scorer.device)
+    r_inputs = _cached_tail_inputs(base_inputs, split, reverse_tail)
+    r_positions = _full_positions(scorer.model, r_inputs, scorer.device)
 
-    @classmethod
-    def from_config(cls, pipeline: dict[str, Any]) -> "ControlledPropagationState":
-        cfg = pipeline.get("propagation", {}) or {}
-        return cls(**{field_name: type(getattr(cls(), field_name))(cfg.get(field_name, getattr(cls(), field_name))) for field_name in (
-            "delta", "beta", "positive_gamma", "cross_zero_history", "cross_zero_prev_min",
-            "cross_zero_current_floor", "cross_zero_cap", "state_reset_below", "negative_ceiling"
-        )})
-
-    def reset(self) -> None:
-        self.evidence = 0.0
-        self.previous_final = 0.0
-        self.semantic_history.clear()
-
-    def step(self, semantic_score: float) -> dict[str, Any]:
-        s = float(semantic_score)
-        state_before = float(self.evidence)
-        recovery_raw = s
-        recovery_candidate = 0
-        cross_zero = 0
-        positive_envelope = 0
-        reason = "raw"
-        if s >= 0.0:
-            if self.previous_final > 0.0 and self.positive_gamma * self.previous_final > s:
-                final = self.positive_gamma * self.previous_final
-                positive_envelope = 1
-                reason = "positive_run_envelope"
-            else:
-                final = s
-                reason = "positive_raw"
-        else:
-            recovery_raw = s + self.beta * math.tanh(state_before)
-            recent = self.semantic_history[-self.cross_zero_history:] if self.cross_zero_history > 0 else []
-            recent_strong = len(recent) == self.cross_zero_history and min(recent) >= self.cross_zero_prev_min
-            if recent_strong and s >= self.cross_zero_current_floor and recovery_raw > 0.0:
-                recovery_candidate = 1
-                cross_zero = 1
-                final = min(self.cross_zero_cap, recovery_raw)
-                reason = "confirmed_shallow_dip_cross_zero"
-            else:
-                final = min(self.negative_ceiling, recovery_raw)
-                if recovery_raw > s:
-                    recovery_candidate = 1
-                    reason = "negative_valley_recovery_sign_preserved"
-                else:
-                    reason = "negative_raw"
-        self.evidence = max(self.delta * state_before, max(s, 0.0))
-        if self.evidence < self.state_reset_below:
-            self.evidence = 0.0
-        self.semantic_history.append(s)
-        self.semantic_history = self.semantic_history[-max(self.cross_zero_history, 1):]
-        self.previous_final = float(final)
-        return {
-            "prop_state_before": state_before,
-            "prop_recovery_raw": recovery_raw,
-            "prop_recovery_candidate": recovery_candidate,
-            "prop_cross_zero": cross_zero,
-            "prop_positive_envelope": positive_envelope,
-            "prop_reason": reason,
-            "prop_state_after": float(self.evidence),
-            "final_score": float(final),
-        }
+    f_logits, f_sec = _tail_logits(scorer.model, scorer.device, f_inputs, f_positions, fork_cache(base_cache), split)
+    r_logits, r_sec = _tail_logits(scorer.model, scorer.device, r_inputs, r_positions, fork_cache(base_cache), split)
+    return {**_score_from_logits(f_logits, r_logits, a_id=scorer.a_id, b_id=scorer.b_id), "query_tail_sec": f_sec + r_sec}
 
 
-def _semantic(q2: float, p3: Any, p4: Any) -> dict[str, float]:
-    p3f = _finite_float(p3)
-    p4f = _finite_float(p4)
-    p3_delta = math.tanh(p3f) if p3f is not None and p3f > 0.0 else 0.0
-    p4_delta = math.tanh(p4f) if p4f is not None and p4f > 0.0 else 0.0
+def _use_cached_text_tails(config: dict[str, Any]) -> bool:
+    pipeline = config.get("pipeline", {}) or {}
+    return bool(pipeline.get("cached_text_tails", True))
+
+
+def _tail_cache_num_images(config: dict[str, Any]) -> int:
+    offsets = [int(x) for x in (config.get("pipeline", {}) or {}).get("current_offsets", [])]
+    return len(offsets) if offsets else 9
+
+
+def _probe_policy(config: dict[str, Any]) -> str:
+    policy = str((config.get("pipeline", {}) or {}).get("probe_policy", "routed")).strip().lower()
+    if policy not in {"routed", "all_probes", "q2_only"}:
+        raise ValueError(f"unknown pipeline.probe_policy={policy!r}; expected routed, all_probes, or q2_only")
+    return policy
+
+
+def _identity_q2_scoring(q2: float) -> dict[str, Any]:
+    q2f = float(q2)
     return {
-        "p3_positive_delta": p3_delta,
-        "p4_positive_delta": p4_delta,
-        "p4_strong_negative_delta": 0.0,
-        "semantic_score": float(q2) + p3_delta + p4_delta,
+        "q3_evidence": 0.0,
+        "p3_evidence": 0.0,
+        "p4_evidence": 0.0,
+        "par_evidence_raw": 0.0,
+        "par_evidence": 0.0,
+        "par_alpha": 0.0,
+        "par_scale": 1.0,
+        "par_delta": 0.0,
+        "par_score": q2f,
+        "local_score": q2f,
+        "semantic_score": q2f,
+        "carry_enabled": 0,
+        "carry_rho": 0.0,
+        "carry_prev_par_delta": 0.0,
+        "carry_prev_positive_delta": 0.0,
+        "carry_budget": 0.0,
+        "carry_rescue_delta": 0.0,
+        "carry_adjusted_par_delta": 0.0,
+        "carry_score": q2f,
+        "carry_applied": 0,
+        "carry_reason": "q2_only",
+        "carry_score_minus_q2": 0.0,
+        "carry_score_minus_raw_par": 0.0,
+        "pre_see_score": q2f,
+        "see_rho": 0.0,
+        "see_horizon": 0,
+        "see_valley_ratio": 0.0,
+        "see_q2_continuity": 0.0,
+        "see_prev1_score": 0.0,
+        "see_prev2_score": 0.0,
+        "see_prev1_positive": 0.0,
+        "see_prev2_positive": 0.0,
+        "see_state_level": 0.0,
+        "see_valley_threshold": 0.0,
+        "see_valley_error": 0.0,
+        "see_q2_prev": 0.0,
+        "see_q2_continuous": 0,
+        "see_gate": 0,
+        "see_positive_valley": 0,
+        "see_negative_valley": 0,
+        "see_weighted_history": 0.0,
+        "see_candidate": q2f,
+        "see_delta": 0.0,
+        "see_applied": 0,
+        "see_cross_zero": 0,
+        "see_reason": "q2_only",
+        "final_score": q2f,
     }
 
 
@@ -424,6 +598,7 @@ def _row_output(
     budget: str,
     reader: SequentialVideoFrameReader,
     blank: Image.Image,
+    text_tail_cache: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, float], dict[str, int]]:
     started = time.perf_counter()
     pipeline = context.config["pipeline"]
@@ -463,8 +638,18 @@ def _row_output(
     executed = {probe: 0 for probe in PROBE_ORDER}
 
     def run_probe(probe: str) -> dict[str, Any]:
-        forward, reverse = _prompt_pair(context.prompts, PROMPT_KEYS[probe])
-        result = _score_probe(scorer, images, base_cache, split, base_inputs, forward, reverse)
+        if text_tail_cache is not None:
+            result = _score_probe_cached_tail(
+                scorer,
+                base_cache,
+                split,
+                base_inputs,
+                text_tail_cache[f"{probe}_forward"],
+                text_tail_cache[f"{probe}_reverse"],
+            )
+        else:
+            forward, reverse = _prompt_pair(context.prompts, PROMPT_KEYS[probe])
+            result = _score_probe(scorer, images, base_cache, split, base_inputs, forward, reverse)
         scores[f"{probe}_score"] = result["score"]
         scores[f"{probe}_forward_margin"] = result["forward_margin"]
         scores[f"{probe}_reverse_margin"] = result["reverse_margin"]
@@ -474,12 +659,25 @@ def _row_output(
         return result
 
     q2 = run_probe("q2")
-    q3 = run_probe("q3")
     q2_score = float(q2["score"])
-    q3_score = float(q3["score"])
+    policy = _probe_policy(context.config)
+    if policy == "q2_only":
+        q3_score = math.nan
+        p3_route = False
+        p4_route = False
+    else:
+        q3 = run_probe("q3")
+        q3_score = float(q3["score"])
 
     p3_cfg = pipeline.get("p3_route", {}) or {}
-    p3_route = q2_score > float(p3_cfg.get("q2_gt", 0.0)) and q3_score >= float(p3_cfg.get("q3_gte", 0.0))
+    p3_route = (
+        policy == "all_probes"
+        or (
+            policy == "routed"
+            and q2_score > float(p3_cfg.get("q2_gt", 0.0))
+            and q3_score >= float(p3_cfg.get("q3_gte", 0.0))
+        )
+    )
     p3_score = math.nan
     if p3_route:
         p3 = run_probe("p3")
@@ -487,10 +685,14 @@ def _row_output(
 
     p4_cfg = pipeline.get("p4_route", {}) or {}
     p4_route = (
-        p3_route
-        and q2_score >= float(p4_cfg.get("q2_gte", 1.0))
-        and q3_score >= float(p4_cfg.get("q3_gte", 0.0))
-        and p3_score <= float(p4_cfg.get("p3_lte", 0.0))
+        policy == "all_probes"
+        or (
+            p3_route
+            and policy == "routed"
+            and q2_score >= float(p4_cfg.get("q2_gte", 1.0))
+            and q3_score >= float(p4_cfg.get("q3_gte", 0.0))
+            and p3_score <= float(p4_cfg.get("p3_lte", 0.0))
+        )
     )
     if p4_route:
         run_probe("p4")
@@ -508,8 +710,18 @@ def _row_output(
         **scores,
         "p3_executed": executed["p3"],
         "p4_executed": executed["p4"],
-        "p3_route_reason": "Q2>0 and Q3>=0" if p3_route else "not_run",
-        "p4_route_reason": "Q2>=1 and Q3>=0 and P3<=0" if p4_route else "not_run",
+        "p3_route_reason": (
+            "force_all_probes" if policy == "all_probes" and p3_route
+            else "Q2>0 and Q3>=0" if p3_route
+            else "q2_only" if policy == "q2_only"
+            else "not_run"
+        ),
+        "p4_route_reason": (
+            "force_all_probes" if policy == "all_probes" and p4_route
+            else "Q2>=1 and Q3>=0 and P3<=0" if p4_route
+            else "q2_only" if policy == "q2_only"
+            else "not_run"
+        ),
         "current_frames": ";".join(str(frame) for frame in frames),
         "video_path": row.get("video_path", ""),
         "frame_substitutions": json.dumps(substitutions, ensure_ascii=False, sort_keys=True),
@@ -570,17 +782,15 @@ def run(context: Any) -> dict[str, Any]:
     scores_path = tables / "final_workflow_scores.csv"
     failures_path = tables / "final_workflow_failures.csv"
     completed_keys = _completed_keys(scores_path)
+    completed_state = _completed_scoring_state(scores_path)
     retry_failures = os.environ.get("PIXEL_BUDGET_RETRY_FAILURES") == "1"
-    retry_keys = _failure_keys(failures_path) if retry_failures else set()
-
     if retry_failures:
-        todo = [
-            row for row in rows
-            if (_video_id(row), intish(row.get("anchor", 0))) in retry_keys
-            and (_video_id(row), intish(row.get("anchor", 0))) not in completed_keys
-        ]
-    else:
-        todo = [row for row in rows if (_video_id(row), intish(row.get("anchor", 0))) not in completed_keys]
+        raise RuntimeError(
+            "PIXEL_BUDGET_RETRY_FAILURES=1 is unsafe for stateful correction carry / SEE because "
+            "windows after a failure may have been scored with reset temporal state. "
+            "Rerun the affected video/shard in a fresh output directory instead."
+        )
+    todo = [row for row in rows if (_video_id(row), intish(row.get("anchor", 0))) not in completed_keys]
     completed = len(completed_keys)
     errors = 0
     buffer: list[dict[str, Any]] = []
@@ -591,12 +801,28 @@ def run(context: Any) -> dict[str, Any]:
     ]}
     counts = {f"{probe}_probe_count": 0 for probe in PROBE_ORDER}
     counts.update({
-        "p3_positive_count": 0,
-        "p4_positive_count": 0,
-        "prop_cross_zero_count": 0,
+        "p3_positive_evidence_count": 0,
+        "p4_positive_evidence_count": 0,
+        "correction_carry_applied_count": 0,
+        "see_applied_count": 0,
+        "see_cross_zero_count": 0,
     })
+    policy = _probe_policy(context.config)
+    # Scoring state is cheap to construct and does not load the MLLM runtime.
+    # Keeping it here also makes the paper-final scoring parameters available in the
+    # summary when a shard is already complete.
+    parsee = PARSEEState.from_pipeline(context.config["pipeline"])
     if not todo:
         _status(context, dataset, budget, "COMPLETE", completed, len(rows), errors, "")
+        summary_path = root / "summary.json"
+        existing_summary: dict[str, Any] = {}
+        if summary_path.exists():
+            try:
+                loaded = json.loads(summary_path.read_text(encoding="utf-8-sig"))
+                if isinstance(loaded, dict):
+                    existing_summary = loaded
+            except Exception:
+                existing_summary = {}
         summary = {
             "status": "COMPLETE",
             "dataset": dataset,
@@ -608,12 +834,21 @@ def run(context: Any) -> dict[str, Any]:
             "elapsed_sec": time.perf_counter() - started,
             "scores_csv": str(scores_path),
             "failures_csv": str(failures_path),
-            "semantic_rule": "Q2 + tanh(P3) if P3>0 + tanh(P4) if P4>0; P4<=0 ignored",
+            "scoring_rule": "PARSEE-VAD: PAR routing -> memoryless current-window fusion -> one-step correction memory -> finite-horizon SEE",
+            "probe_policy": policy,
+            "proposition_runtime": existing_summary.get(
+                "proposition_runtime", "unknown_existing_completed_output"
+            ),
+            "text_tail_cache_build_sec": existing_summary.get("text_tail_cache_build_sec", None),
+            "par_alpha": float(parsee.config.par.alpha),
+            "correction_carry_rho": float(parsee.config.correction_carry.rho),
+            "see_rho": float(parsee.config.see.rho),
+            "see_horizon": int(parsee.config.see.horizon),
             "resume_note": "no pending windows; model runtime was not loaded",
             **timings,
             **counts,
         }
-        write_json(root / "summary.json", summary)
+        write_json(summary_path, summary)
         return summary
 
     runtime = context.scorer._runtime()
@@ -626,12 +861,21 @@ def run(context: Any) -> dict[str, Any]:
         runtime.b_id,
         thinking=bool((context.config.get("model", {}) or {}).get("thinking", False)),
     )
+    text_tail_cache = None
+    tail_cache_sec = 0.0
+    if _use_cached_text_tails(context.config):
+        t0 = time.perf_counter()
+        text_tail_cache = _build_text_tail_cache(
+            scorer,
+            context.prompts,
+            num_images=_tail_cache_num_images(context.config),
+        )
+        tail_cache_sec = time.perf_counter() - t0
     append_every = int((context.config.get("pipeline", {}) or {}).get("append_every", 8) or 8)
     status_every = int((context.config.get("pipeline", {}) or {}).get("status_every_anchors", 8) or 8)
 
     current_video = None
     reader: SequentialVideoFrameReader | None = None
-    prop = ControlledPropagationState.from_config(context.config["pipeline"])
     blank = Image.new("RGB", BLANK_SIZE, "black")
     _status(context, dataset, budget, "RUNNING", completed, len(rows), errors, "")
 
@@ -643,18 +887,56 @@ def run(context: Any) -> dict[str, Any]:
                         reader.close()
                     current_video = _video_id(row)
                     reader = SequentialVideoFrameReader(Path(row["video_path"]))
-                    prop.reset()
+                    parsee.reset()
+                    # Safe interrupted-run resume:
+                    #   1) restore the immediately previous RAW PAR delta for
+                    #      one-step correction carry;
+                    #   2) restore the last SEE-horizon PRE-SEE scores, which
+                    #      are carry_score values (never final_score).
+                    current_anchor = intish(row.get("anchor", 0))
+                    prior = [
+                        item for item in completed_state.get(current_video, [])
+                        if item[0] < current_anchor
+                    ]
+                    if prior:
+                        pre_see_scores = [item[2] for item in prior]
+                        q2_values = [item[3] for item in prior]
+                        previous_raw_par_delta = prior[-1][1]
+                        parsee.seed_history(
+                            pre_see_scores,
+                            previous_raw_par_delta=previous_raw_par_delta,
+                            q2_values=q2_values,
+                        )
                 assert reader is not None
-                output, row_timings, row_counts = _row_output(context, scorer, row, dataset, budget, reader, blank)
-                semantic = _semantic(float(output["q2_score"]), output.get("p3_score"), output.get("p4_score"))
-                output.update(semantic)
-                propagated = prop.step(float(semantic["semantic_score"]))
-                output.update(propagated)
-                if semantic["p3_positive_delta"] > 0:
-                    counts["p3_positive_count"] += 1
-                if semantic["p4_positive_delta"] > 0:
-                    counts["p4_positive_count"] += 1
-                counts["prop_cross_zero_count"] += int(propagated["prop_cross_zero"])
+                output, row_timings, row_counts = _row_output(
+                    context,
+                    scorer,
+                    row,
+                    dataset,
+                    budget,
+                    reader,
+                    blank,
+                    text_tail_cache=text_tail_cache,
+                )
+                if policy == "q2_only":
+                    scored = _identity_q2_scoring(float(output["q2_score"]))
+                else:
+                    scored = parsee.step(
+                        q2=float(output["q2_score"]),
+                        q3=float(output["q3_score"]),
+                        p3=output.get("p3_score"),
+                        p4=output.get("p4_score"),
+                        p3_executed=bool(intish(output.get("p3_executed", 0))),
+                        p4_executed=bool(intish(output.get("p4_executed", 0))),
+                    )
+                output.update(scored)
+                if scored["p3_evidence"] > 0:
+                    counts["p3_positive_evidence_count"] += 1
+                if scored["p4_evidence"] > 0:
+                    counts["p4_positive_evidence_count"] += 1
+                counts["correction_carry_applied_count"] += int(scored["carry_applied"])
+                counts["see_applied_count"] += int(scored["see_applied"])
+                counts["see_cross_zero_count"] += int(scored["see_cross_zero"])
                 buffer.append(output)
                 completed += 1
                 for key, value in row_timings.items():
@@ -666,7 +948,7 @@ def run(context: Any) -> dict[str, Any]:
                     buffer.clear()
             except Exception as exc:
                 errors += 1
-                prop.reset()
+                parsee.reset()
                 _append_csv(failures_path, FAILURE_FIELDS, [{
                     "dataset": dataset,
                     "pixel_budget": budget,
@@ -701,7 +983,14 @@ def run(context: Any) -> dict[str, Any]:
         "elapsed_sec": time.perf_counter() - started,
         "scores_csv": str(scores_path),
         "failures_csv": str(failures_path),
-        "semantic_rule": "Q2 + tanh(P3) if P3>0 + tanh(P4) if P4>0; P4<=0 ignored",
+        "scoring_rule": "PARSEE-VAD: PAR routing -> memoryless current-window fusion -> one-step correction memory -> finite-horizon SEE",
+        "probe_policy": policy,
+        "proposition_runtime": PROPOSITION_RUNTIME_VERSION if text_tail_cache is not None else "full_multimodal_encode_per_probe",
+        "text_tail_cache_build_sec": tail_cache_sec,
+        "par_alpha": float(parsee.config.par.alpha),
+        "correction_carry_rho": float(parsee.config.correction_carry.rho),
+        "see_rho": float(parsee.config.see.rho),
+        "see_horizon": int(parsee.config.see.horizon),
         **timings,
         **counts,
     }

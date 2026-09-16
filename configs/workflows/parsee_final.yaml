@@ -1,4 +1,4 @@
-name: parsee_vad_pixel_budget_sweep
+name: parsee_vad_paper_final
 
 model:
   config: configs/model/qwen35_9b_config.json
@@ -6,10 +6,14 @@ model:
   device: 0
 
 pipeline:
+  version: parsee_iclr2027
   type: pixel_budget_sweep
+  probe_policy: routed
   input_mode: multi_image_9f
   current_offsets: [-80, -70, -60, -50, -40, -30, -20, -10, 0]
   q2_positive_threshold: 0.0
+
+  # Proposition-Aware Routing (PAR)
   p3_route:
     q2_gt: 0.0
     q3_gte: 0.0
@@ -17,29 +21,32 @@ pipeline:
     q2_gte: 1.0
     q3_gte: 0.0
     p3_lte: 0.0
-  semantic_rerank:
-    p3_positive: true
-    p4_positive: true
-    p4_negative_suppression: false
-  propagation:
+
+  # Bounded current-window proposition fusion.
+  par:
+    alpha: 0.75
+
+  # One-step, non-recursive carry of the previous raw positive PAR correction.
+  correction_carry:
     enabled: true
-    delta: 0.95
-    beta: 1.5
-    positive_gamma: 0.7
-    cross_zero_history: 3
-    cross_zero_prev_min: 0.5
-    cross_zero_current_floor: -1.0
-    cross_zero_cap: 0.25
-    state_reset_below: 0.05
-    negative_ceiling: -0.000001
+    rho: 0.5
+
+  # Streaming Evidence Escalation (SEE): finite-horizon valley recovery.
+  see:
+    enabled: true
+    horizon: 2
+    valley_ratio: 0.2
+    q2_continuity: 0.5
+    rho: 0.5
+
   status_every_anchors: 8
   append_every: 8
 
 pixel_budgets:
   default:
-    max_pixels:
-    min_pixels:
-    preserve_processor_default: true
+    max_pixels: 262144
+    min_pixels: 1
+    preserve_processor_default: false
   256sq:
     max_pixels: 65536
     min_pixels: 1
@@ -82,6 +89,7 @@ output:
   root: runs
 
 launch:
-  gpus: [0, 1, 2, 3]
-  shards: 4
+  # Portable public default. Increase GPUs/shards to parallelize independent videos.
+  gpus: [0]
+  shards: 1
   max_parallel_configs: 1

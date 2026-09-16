@@ -13,22 +13,17 @@ from pathlib import Path
 from statistics import mean, median
 from typing import Any
 
-import yaml
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.evaluation.metrics import ap, auroc, floatish, intish
+from src.utils.io import read_yaml
 from src.workflows.full_workflow import _read_rows, _video_id
 
 RUN_GROUP = "parsee_vad_pixel_budget_sweep"
-DEFAULT_CONFIG = ROOT / "configs" / "workflows" / "pixel_budget_sweep.yaml"
+DEFAULT_CONFIG = ROOT / "configs" / "workflows" / "parsee_final.yaml"
 DEFAULT_PROMPTS = ROOT / "configs" / "workflows" / "full_workflow_prompts.yaml"
-
-
-def read_yaml(path: Path) -> dict[str, Any]:
-    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
@@ -59,22 +54,22 @@ def git_commit() -> str:
         return "unknown"
 
 
-def snapshot_config(base: Path, config_path: Path, prompts_path: Path, model_config_path: Path) -> None:
+def snapshot_config(base: Path, config_path: Path, prompts_path: Path, model_config_path: Path, artifact_prefix: str = "") -> None:
     cfg = base / "configs"
     cfg.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(config_path, cfg / "workflow.yaml")
-    shutil.copy2(prompts_path, cfg / "prompts.yaml")
-    shutil.copy2(model_config_path, cfg / "model.json")
+    shutil.copy2(config_path, cfg / f"{artifact_prefix}workflow.yaml")
+    shutil.copy2(prompts_path, cfg / f"{artifact_prefix}prompts.yaml")
+    shutil.copy2(model_config_path, cfg / f"{artifact_prefix}model.json")
 
 
-def ensure_run_identity(base: Path, config_path: Path, prompts_path: Path, model_config_path: Path, selected_matrix: list[tuple[str, str]], retry_failures: bool) -> None:
+def ensure_run_identity(base: Path, config_path: Path, prompts_path: Path, model_config_path: Path, selected_matrix: list[tuple[str, str]], retry_failures: bool, artifact_prefix: str = "") -> None:
     identity = {
         "experiment": RUN_GROUP, "run_dir": str(base), "git_commit": git_commit(),
         "config_sha256": file_sha256(config_path), "prompts_sha256": file_sha256(prompts_path),
         "model_config_sha256": file_sha256(model_config_path),
         "matrix": selected_matrix, "retry_failures": bool(retry_failures),
     }
-    manifest = base / "run_manifest.json"
+    manifest = base / f"{artifact_prefix}run_manifest.json"
     if manifest.exists():
         old = read_json(manifest)
         for key in ("config_sha256", "prompts_sha256", "model_config_sha256"):
@@ -177,13 +172,19 @@ def summarize_config(base: Path, dataset: str, budget: str) -> dict[str, Any]:
     failure_rows = 0
     for path in (base / "outputs" / dataset / budget).glob("shard_*_of_*/tables/final_workflow_failures.csv"):
         with path.open(newline="", encoding="utf-8-sig", errors="replace") as handle: failure_rows += sum(1 for _ in csv.DictReader(handle))
-    q2_auc, q2_ap = score_metrics(rows, "q2_score"); sem_auc, sem_ap = score_metrics(rows, "semantic_score"); final_auc, final_ap = score_metrics(rows, "final_score")
+    q2_auc, q2_ap = score_metrics(rows, "q2_score")
+    par_auc, par_ap = score_metrics(rows, "par_score")
+    carry_auc, carry_ap = score_metrics(rows, "carry_score")
+    final_auc, final_ap = score_metrics(rows, "final_score")
     lat = [floatish(r.get("total_window_time_sec")) for r in rows if r.get("total_window_time_sec") not in (None, "")]
     pix = [floatish(r.get("actual_resized_area_mean")) for r in rows if r.get("actual_resized_area_mean") not in (None, "")]
     toks = [floatish(r.get("visual_token_count")) for r in rows if r.get("visual_token_count") not in (None, "")]
     summary = {
         "dataset": dataset, "pixel_budget": budget, "windows": len(rows), "videos": len({_video_id(r) for r in rows}), "failures": failure_rows,
-        "auroc_q2": q2_auc, "ap_q2": q2_ap, "auroc_semantic": sem_auc, "ap_semantic": sem_ap, "auroc_final": final_auc, "ap_final": final_ap,
+        "auroc_q2": q2_auc, "ap_q2": q2_ap,
+        "auroc_par": par_auc, "ap_par": par_ap,
+        "auroc_carry": carry_auc, "ap_carry": carry_ap,
+        "auroc_final": final_auc, "ap_final": final_ap,
         "delta_auc_vs_q2": None if q2_auc is None or final_auc is None else final_auc-q2_auc,
         "delta_ap_vs_q2": None if q2_ap is None or final_ap is None else final_ap-q2_ap,
         "mean_latency": mean(lat) if lat else None, "median_latency": median(lat) if lat else None, "p95_latency": percentile(lat, .95),
@@ -191,7 +192,7 @@ def summarize_config(base: Path, dataset: str, budget: str) -> dict[str, Any]:
         "mean_visual_tokens": mean(toks) if toks else None, "median_visual_tokens": median(toks) if toks else None, "p95_visual_tokens": percentile(toks, .95),
         "p3_executed": sum(intish(r.get("p3_executed")) for r in rows), "p3_positive": sum(1 for r in rows if floatish(r.get("p3_score", ""), -1e9) > 0),
         "p4_executed": sum(intish(r.get("p4_executed")) for r in rows), "p4_positive": sum(1 for r in rows if floatish(r.get("p4_score", ""), -1e9) > 0),
-        "propagation_cross_zero": sum(intish(r.get("prop_cross_zero")) for r in rows),
+        "see_cross_zero": sum(intish(r.get("see_cross_zero")) for r in rows),
     }
     write_json(base / "summaries" / dataset / budget / "summary.json", summary)
     return summary
@@ -199,7 +200,7 @@ def summarize_config(base: Path, dataset: str, budget: str) -> dict[str, Any]:
 
 def write_total_summary(base: Path, rows: list[dict[str, Any]]) -> None:
     path = base / "summaries" / "pixel_budget_sweep_summary.csv"; path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["dataset","pixel_budget","windows","videos","failures","auroc_q2","ap_q2","auroc_semantic","ap_semantic","auroc_final","ap_final","delta_auc_vs_q2","delta_ap_vs_q2","mean_latency","median_latency","p95_latency","mean_pixels","median_pixels","p95_pixels","mean_visual_tokens","median_visual_tokens","p95_visual_tokens","p3_executed","p3_positive","p4_executed","p4_positive","propagation_cross_zero"]
+    fields = ["dataset","pixel_budget","windows","videos","failures","auroc_q2","ap_q2","auroc_par","ap_par","auroc_carry","ap_carry","auroc_final","ap_final","delta_auc_vs_q2","delta_ap_vs_q2","mean_latency","median_latency","p95_latency","mean_pixels","median_pixels","p95_pixels","mean_visual_tokens","median_visual_tokens","p95_visual_tokens","p3_executed","p3_positive","p4_executed","p4_positive","see_cross_zero"]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore"); writer.writeheader(); writer.writerows(rows)
 
@@ -211,13 +212,14 @@ def main() -> None:
     parser.add_argument("--dataset", choices=["ucf","msad","xd","ubnormal"]); parser.add_argument("--budget", choices=["default","256sq","384sq","512sq"])
     parser.add_argument("--resume", action="store_true", help="Accepted for explicitness; an existing matching run directory is resumed automatically.")
     parser.add_argument("--retry-failures", action="store_true"); parser.add_argument("--dry-run", action="store_true"); parser.add_argument("--no-wait", action="store_true"); parser.add_argument("--poll-sec", type=int, default=30)
+    parser.add_argument("--artifact-prefix", default="", help="Optional prefix for generated run metadata filenames.")
     args = parser.parse_args()
     config_path = args.config.resolve(); prompts_path = args.prompts.resolve(); config = read_yaml(config_path)
     selected = matrix(config, args.dataset, args.budget); base = run_dir(args.run_id)
     model_config_path = Path(str((config.get("model", {}) or {}).get("config", "configs/model/qwen35_9b_config.json")))
     if not model_config_path.is_absolute(): model_config_path = ROOT / model_config_path
     base.mkdir(parents=True, exist_ok=True); (base/"logs").mkdir(exist_ok=True); (base/"status").mkdir(exist_ok=True); (base/"outputs").mkdir(exist_ok=True)
-    ensure_run_identity(base, config_path, prompts_path, model_config_path, selected, args.retry_failures); snapshot_config(base, config_path, prompts_path, model_config_path)
+    ensure_run_identity(base, config_path, prompts_path, model_config_path, selected, args.retry_failures, args.artifact_prefix); snapshot_config(base, config_path, prompts_path, model_config_path, args.artifact_prefix)
     # Fail before GPU launch if a selected manifest is missing.
     for dataset, _ in selected: _read_rows(config, dataset)
     shards = int((config.get("launch", {}) or {}).get("shards", 4)); summaries: list[dict[str, Any]] = []
@@ -237,7 +239,7 @@ def main() -> None:
             print(f"RESUME STALE {dataset}/{budget}", flush=True)
         print(f"LAUNCH {dataset}/{budget} previous={state}", flush=True)
         records = launch_config(base,config,config_path,prompts_path,dataset,budget,args.dry_run,args.retry_failures)
-        write_json(base/"status"/dataset/budget/"launch.json", {"state":"DRY_RUN" if args.dry_run else "RUNNING","retry_failures":bool(args.retry_failures),"workers":records})
+        write_json(base/"status"/dataset/budget/f"{args.artifact_prefix}launch.json", {"state":"DRY_RUN" if args.dry_run else "RUNNING","retry_failures":bool(args.retry_failures),"workers":records})
         if args.dry_run or args.no_wait: continue
         final = wait_config(base,dataset,budget,shards,args.poll_sec); print(f"DONE {dataset}/{budget} state={final}", flush=True)
         if final in {"COMPLETE","COMPLETE_WITH_ERRORS"}: summaries.append(summarize_config(base,dataset,budget))
